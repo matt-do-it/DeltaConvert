@@ -6,4 +6,5 @@ edition = "2021"
 [dependencies]
 arrow = "54.0.0"
 deltalake = "0.25.0"
+parquet = "54.0.0"
 tokio = "1.44.1"
