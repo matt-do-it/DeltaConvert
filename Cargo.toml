@@ -1,0 +1,9 @@
+[package]
+name = "delta_convert"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arrow = "54.0.0"
+deltalake = "0.25.0"
+tokio = "1.44.1"
