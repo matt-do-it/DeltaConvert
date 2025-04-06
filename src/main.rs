@@ -1,17 +1,20 @@
 use std::ffi::CStr;
 use std::fs::File;
-use std::os::raw::c_char;
 use std::sync::Arc;
 
+use arrow::array::RecordBatchReader;
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use arrow::record_batch::RecordBatch;
 
 use deltalake::writer::DeltaWriter;
 use deltalake::DeltaOps;
-use deltalake::DeltaTableError;
 
 #[derive(Debug)]
 struct ConvertError;
+
+pub struct DeltaHandle {
+    writer: deltalake::writer::RecordBatchWriter,
+}
 
 fn create_arrow_record_batch() -> RecordBatch {
     let schema = ArrowSchema::new(vec![
@@ -30,8 +33,8 @@ fn create_arrow_record_batch() -> RecordBatch {
     for _n in 0..100 {
         group_builder.append_value("Group");
         value_builder.append_value(10000);
-        date_builder.append_value("Group");
-        url_builder.append_value("Group");
+        date_builder.append_value("2025-01-01");
+        url_builder.append_value("http://www.test.de");
     }
 
     let group_array = group_builder.finish();
@@ -71,8 +74,8 @@ fn create_arrow_record_batch_reader() -> impl arrow::array::RecordBatchReader {
 async fn write_parquet(
     name: &str,
     record_batch_reader: &mut dyn arrow::array::RecordBatchReader,
-) -> Result<(), std::io::Error> {
-    let file = std::fs::File::create(name)?;
+) -> Result<(), ConvertError> {
+    let file = std::fs::File::create(name).map_err(|_| ConvertError)?;
 
     let props = parquet::file::properties::WriterProperties::builder()
         .set_compression(parquet::basic::Compression::SNAPPY)
@@ -85,7 +88,6 @@ async fn write_parquet(
         let _result = writer.write(&batch.unwrap()).expect("Writing batch");
     }
 
-    // writer must be closed to write footer
     writer.close().unwrap();
 
     Ok(())
@@ -93,88 +95,186 @@ async fn write_parquet(
 
 async fn parquet_record_batch_reader(
     name: &str,
-) -> Result<parquet::arrow::arrow_reader::ParquetRecordBatchReader, parquet::errors::ParquetError> {
+) -> Result<parquet::arrow::arrow_reader::ParquetRecordBatchReader, ConvertError> {
     let file = File::open(name).unwrap();
 
     let builder =
         parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
 
-    builder.build()
+    builder.build().map_err(|_| ConvertError)
 }
 
-async fn convert_delta_async(
+// We are just initing, as we take the first record batch to get the schema
+async fn init_delta_table_rust(
     name: &str,
-    record_batch_reader: &mut dyn arrow::array::RecordBatchReader,
-) -> Result<(), DeltaTableError> {
-    let arrow_schema = record_batch_reader.schema();
-    let delta_schema = deltalake::kernel::Schema::try_from(arrow_schema)?;
+    arrow_schema: &ArrowSchema,
+) -> Result<DeltaHandle, ConvertError> {
+    let delta_schema =
+        deltalake::kernel::Schema::try_from(arrow_schema).map_err(|_| ConvertError)?;
 
     let ops = DeltaOps::try_from_uri(name).await.unwrap();
 
     let delta_table = ops
         .create()
         .with_columns(delta_schema.fields().into_iter().cloned())
-        .await?;
+        .await
+        .map_err(|_| ConvertError)?;
 
-    let mut writer = deltalake::writer::RecordBatchWriter::for_table(&delta_table)?;
+    let writer =
+        deltalake::writer::RecordBatchWriter::for_table(&delta_table).map_err(|_| ConvertError)?;
 
-    for batch in record_batch_reader {
-        let _result = writer.write(batch?).await?;
-    }
-
-    writer.flush().await?;
-
-    Ok(())
+    Ok(DeltaHandle { writer: writer })
 }
 
-pub extern "C" fn convert_delta_extern(
-    name: *const c_char,
-    record_batch_reader: &mut dyn arrow::array::RecordBatchReader,
-) -> i32 {
+#[no_mangle]
+pub extern "C" fn init_delta_table(
+    name: *const i8,
+    schema: &deltalake::arrow::array::ffi::FFI_ArrowSchema,
+) -> *mut DeltaHandle {
     unsafe {
-        let name_str_result = CStr::from_ptr(name).to_str();
-        if !name_str_result.is_ok() {
-            return -1;
+        let c_name = CStr::from_ptr(name).to_str();
+        let c_name_str = c_name.unwrap_unchecked();
+
+        let rust_schema = ArrowSchema::try_from(schema);
+        if !rust_schema.is_ok() {
+            return std::ptr::null_mut();
         }
-        let name_str = name_str_result.unwrap_unchecked();
 
         let result = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap()
-            .block_on(convert_delta_async(name_str, record_batch_reader));
+            .block_on(init_delta_table_rust(
+                &c_name_str,
+                &rust_schema.unwrap_unchecked(),
+            ));
+
         if !result.is_ok() {
-            return -2;
+            return std::ptr::null_mut();
+        }
+
+        let boxed = Box::new(result.unwrap_unchecked());
+        Box::into_raw(boxed)
+    }
+}
+
+// Read an IPC buffer
+async fn write_delta_table_rust(
+    handle: &mut DeltaHandle,
+    in_data: *const u8,
+    in_size: usize,
+) -> Result<(), ConvertError> {
+    unsafe {
+        let data_slice = std::slice::from_raw_parts(in_data, in_size);
+        let data_vec = data_slice.to_vec();
+
+        let cursor = std::io::Cursor::new(data_vec);
+        let reader =
+            arrow::ipc::reader::StreamReader::try_new(cursor, None).map_err(|_| ConvertError)?;
+
+        for result_batch in reader {
+            let result_record_batch = result_batch.map_err(|_| ConvertError)?;
+            let _result = handle
+                .writer
+                .write(result_record_batch)
+                .await
+                .map_err(|_| ConvertError)?;
         }
     }
+    Ok(())
+}
 
-    return 0;
+#[no_mangle]
+pub extern "C" fn write_delta_table(
+    handle: *mut DeltaHandle,
+    in_data: *const u8,
+    in_size: usize,
+) -> i32 {
+    unsafe {
+        let result = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(write_delta_table_rust(&mut *handle, in_data, in_size));
+
+        if !result.is_ok() {
+            return -1;
+        }
+
+        return 0;
+    }
+}
+
+async fn close_delta_table_rust(handle: &mut DeltaHandle) -> Result<(), ConvertError> {
+    handle.writer.flush().await.map_err(|_| ConvertError)?;
+
+    Ok(())
+}
+
+#[no_mangle]
+pub extern "C" fn close_delta_table(handle: *mut DeltaHandle) -> i32 {
+    if !handle.is_null() {
+        unsafe {
+            let result = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(close_delta_table_rust(&mut *handle));
+
+            if !result.is_ok() {
+                drop(Box::from_raw(handle)); // This will drop the Box, freeing the memory
+                return -1;
+            } else {
+                return 0;
+            }
+        }
+    } else {
+        return -1;
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), ConvertError> {
+    //
+    // Create sample arrow reader
+    //
     let mut sample_record_batch_reader = create_arrow_record_batch_reader();
-    write_parquet("test.parquet", &mut sample_record_batch_reader)
-        .await
-        .map_err(|_| ConvertError)?;
 
-    let mut parquet_record_batch_reader = parquet_record_batch_reader("test.parquet")
-        .await
-        .map_err(|_| ConvertError)?;
-    convert_delta_async("delta", &mut parquet_record_batch_reader)
-        .await
-        .map_err(|_| ConvertError)?;
+    //
+    // Write example parquet file
+    //
+    let _ = write_parquet("test1.parquet", &mut sample_record_batch_reader).await;
+
+    //
+    // Create parquet reader
+    //
+    let file_reader = parquet_record_batch_reader("test1.parquet").await?;
+
+    //
+    // Create delta handle
+    //
+    let mut handle = init_delta_table_rust("delta", &file_reader.schema()).await?;
+
+    //
+    // Read batches from reader and write them to delta
+    //
+    for batch in file_reader {
+        let record_batch = batch.map_err(|_| ConvertError)?;
+        let mut buffer = Vec::new();
+        let mut writer =
+            arrow::ipc::writer::StreamWriter::try_new(&mut buffer, &record_batch.schema())
+                .map_err(|_| ConvertError)?;
+
+        writer.write(&record_batch).unwrap();
+        writer.finish().unwrap();
+
+        write_delta_table_rust(&mut handle, buffer.as_ptr(), buffer.len()).await?;
+    }
+
+    //
+    // Close delta handle
+    //
+    close_delta_table_rust(&mut handle).await?;
+
     Ok(())
-    // let c_name = CString::new("delta4").expect("CString::new failed");
-    //
-    //
-    // 	let status_code = convert_delta_extern(c_name.as_ptr(), &mut record_batch_reader);
-    //
-    // 	if status_code == 0 {
-    //         println!("Program ran successfully.");
-    //         Ok(())  // Return success with Ok(())
-    //     } else {
-    //         eprintln!("Error occurred.");
-    //         Err(status_code)  // Return error with Err(status_code)
-    //     }
 }
